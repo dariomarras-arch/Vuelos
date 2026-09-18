@@ -6,7 +6,7 @@
 // charts show a believable, analyzable market instead of pure noise.
 // ---------------------------------------------------------------------------
 
-import { Airline, Airport, AirportGroup, BaggageOption, TimeSlotKey } from "@/lib/types";
+import { Airline, Airport, AirportGroup, BaggageAllowance, TimeSlotKey } from "@/lib/types";
 
 export function hashString(input: string): number {
   let h = 2166136261;
@@ -134,19 +134,36 @@ export function slotPriceFactor(origin: string, destination: string, slot: TimeS
   return 0.9 + rng() * 0.28;
 }
 
-export function baggageCost(option: BaggageOption, basePrice: number): number | null {
-  switch (option) {
-    case "none":
-      return 0;
-    case "carry_on":
-      return Math.round(basePrice * 0.06);
-    case "checked_1":
-      return Math.round(basePrice * 0.14);
-    case "checked_multiple":
-      return Math.round(basePrice * 0.24);
-    default:
-      return null;
+/**
+ * Simplified, clearly-simulated child fare bands — NOT a real airline fare
+ * rule (real rules vary per airline/route, which is exactly the audit
+ * finding this replaces: a flat per-head price is wrong). Infants pay a
+ * fraction (no seat), children a partial fare, everyone else the adult
+ * rate.
+ */
+export function childFareFactor(age: number): number {
+  if (age < 2) return 0.1;
+  if (age < 12) return 0.75;
+  return 1;
+}
+
+/**
+ * Simulates baggage as an attribute of the OFFER (never a search input).
+ * ~15% of generated offers deliberately omit baggage details entirely, to
+ * exercise the "no informado" path the way a real provider sometimes will.
+ */
+export function generateBaggageAllowance(rng: () => number, adultPrice: number): BaggageAllowance {
+  const informed = rng() < 0.85;
+  if (!informed) {
+    return { included: null, checkedBags: null, carryOnIncluded: null, addCost: null };
   }
+  const included = rng() < 0.55;
+  return {
+    included,
+    checkedBags: included ? (rng() < 0.7 ? 1 : 2) : 0,
+    carryOnIncluded: rng() < 0.9,
+    addCost: included ? null : Math.round(adultPrice * (0.08 + rng() * 0.1)),
+  };
 }
 
 export function pickAirline(rng: () => number): Airline {

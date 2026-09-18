@@ -1,14 +1,16 @@
 import { getReadyRepository } from "@/lib/data/ready";
 import { computeHistoricalStats } from "@/lib/analytics/stats";
 import { evaluateOpportunity } from "@/lib/analytics/opportunity";
+import { computePricePosition } from "@/lib/analytics/pricePosition";
 import { explainOpportunity } from "@/lib/ai/explain";
 import { buildRoutes } from "@/lib/engine/combinations";
-import { Alert, BestCombination, FlightSearch, HistoricalStats, SearchRun } from "@/lib/types";
+import { Alert, BestCombination, FlightSearch, HistoricalStats, PricePosition, referenceUnitPrice, SearchRun } from "@/lib/types";
 
 export interface SearchDetailData {
   search: FlightSearch;
   best: BestCombination | null;
   aiExplanation: string | null;
+  pricePosition: PricePosition | null;
   stats: HistoricalStats | null;
   priceHistory: { date: string; price: number }[];
   recentRuns: SearchRun[];
@@ -36,6 +38,7 @@ export async function getSearchDetail(searchId: string): Promise<SearchDetailDat
 
   let best: BestCombination | null = null;
   let aiExplanation: string | null = null;
+  let pricePosition: PricePosition | null = null;
   if (results.length > 0) {
     const statsCache = new Map<string, HistoricalStats>();
     for (const flight of results) {
@@ -58,13 +61,15 @@ export async function getSearchDetail(searchId: string): Promise<SearchDetailDat
     }
     if (best) {
       const key = `${best.flightResult.origin}-${best.flightResult.destination}`;
+      const bestStats = statsCache.get(key)!;
       aiExplanation = explainOpportunity({
         flight: best.flightResult,
-        historicalStats: statsCache.get(key)!,
+        historicalStats: bestStats,
         level: best.opportunity.level,
         targetPrice: search.targetPrice,
         maxPrice: search.maxPrice,
       });
+      pricePosition = computePricePosition(referenceUnitPrice(best.flightResult), bestStats);
     }
   }
 
@@ -75,6 +80,7 @@ export async function getSearchDetail(searchId: string): Promise<SearchDetailDat
     search,
     best,
     aiExplanation,
+    pricePosition,
     stats,
     priceHistory,
     recentRuns,

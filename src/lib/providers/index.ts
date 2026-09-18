@@ -3,10 +3,12 @@
 // implementation is active. To connect a real API:
 //
 //   1. Implement `FlightSearchProvider` in a new file, e.g.
-//      `AmadeusFlightProvider.ts`.
+//      `DuffelFlightProvider.ts` (see the technical audit for why Duffel/
+//      SerpApi are the realistic candidates — Amadeus Self-Service was
+//      decommissioned in July 2026).
 //   2. Import it below and add it to `PROVIDERS`.
-//   3. Set FLIGHT_API_PROVIDER=amadeus and the corresponding credentials in
-//      your environment (see .env.example).
+//   3. Set FLIGHT_API_PROVIDER=duffel (or serpapi) and the corresponding
+//      credentials in your environment (see .env.example).
 //
 // Nothing else in the codebase needs to change — every screen and API route
 // talks to `getActiveProvider()`, never to a concrete implementation.
@@ -18,7 +20,8 @@ import { ProviderConfig, ProviderId } from "@/lib/types";
 
 const PROVIDERS: Partial<Record<ProviderId, FlightSearchProvider>> = {
   mock: mockFlightProvider,
-  // amadeus: amadeusFlightProvider,  // <-- uncomment once implemented
+  // duffel: duffelFlightProvider,   // <-- uncomment once implemented
+  // serpapi: serpApiFlightProvider, // <-- uncomment once implemented
 };
 
 function envProvider(): ProviderId {
@@ -39,9 +42,14 @@ export function getProviderConfig(): ProviderConfig {
     available: [
       { id: "mock", label: "Mock Flight Provider (demo)", configured: true },
       {
-        id: "amadeus",
-        label: "Amadeus Self-Service API",
-        configured: Boolean(process.env.FLIGHT_API_KEY && process.env.FLIGHT_API_SECRET),
+        id: "duffel",
+        label: "Duffel (no conectado)",
+        configured: Boolean(process.env.FLIGHT_API_KEY),
+      },
+      {
+        id: "serpapi",
+        label: "SerpApi — Google Flights (no conectado)",
+        configured: Boolean(process.env.FLIGHT_API_KEY),
       },
       {
         id: "custom",

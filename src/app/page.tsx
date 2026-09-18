@@ -7,6 +7,7 @@ import { PriceHistoryChart } from "@/components/charts/PriceHistoryChart";
 import { BestDatesChart } from "@/components/charts/BestDatesChart";
 import { TimeSlotChart } from "@/components/charts/TimeSlotChart";
 import { hoursSince, money, pct } from "@/lib/utils/format";
+import { referenceUnitPrice } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +15,10 @@ export default async function DashboardPage() {
   const data = await getDashboardData();
   const bestOpportunity = data.topOpportunities[0] ?? null;
   const currency = data.primarySearch?.currency ?? "USD";
+  // All the metric cards below compare on the per-adult reference price —
+  // the same unit as targetPrice/maxPrice and the historical stats — never
+  // the party total (see referenceUnitPrice in types.ts).
+  const bestReferencePrice = bestOpportunity ? referenceUnitPrice(bestOpportunity.flightResult) : null;
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8">
@@ -48,18 +53,15 @@ export default async function DashboardPage() {
           </section>
 
           <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            <MetricCard
-              label="Precio actual"
-              value={bestOpportunity ? money(bestOpportunity.flightResult.price.effectivePrice, currency) : "—"}
-            />
+            <MetricCard label="Precio actual" value={bestReferencePrice !== null ? money(bestReferencePrice, currency) : "—"} />
             <MetricCard label="Precio objetivo" value={data.primarySearch ? money(data.primarySearch.targetPrice, currency) : "—"} />
             <MetricCard label="Promedio" value={money(data.stats?.average ?? null, currency)} />
             <MetricCard label="Mínimo histórico" value={money(data.stats?.min ?? null, currency)} />
             <MetricCard
               label="Ahorro potencial"
               value={
-                bestOpportunity && data.stats?.average
-                  ? money(Math.max(0, data.stats.average - bestOpportunity.flightResult.price.effectivePrice), currency)
+                bestReferencePrice !== null && data.stats?.average
+                  ? money(Math.max(0, data.stats.average - bestReferencePrice), currency)
                   : "—"
               }
               accent="up"

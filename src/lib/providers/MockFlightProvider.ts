@@ -5,6 +5,14 @@
 // Every price is clearly synthetic and the rest of the app is responsible
 // for labelling it as such ("MODO DEMO — DATOS SIMULADOS"); this file never
 // pretends to be a real market.
+//
+// v2: now simulates the things a real integration will actually have to
+// deal with — differentiated adult/child pricing, baggage as an offer
+// attribute, ephemeral offers, and occasional provider errors — all
+// configurable via `mockFlightProvider.configure(...)` so tests (and the
+// running app) can exercise both the happy path and the failure paths on
+// demand. Defaults are reliable (errorRate 0) so seeding/demo mode never
+// flakes.
 // ---------------------------------------------------------------------------
 
 import { addDays, differenceInCalendarDays, formatISO, parseISO } from "date-fns";
@@ -14,11 +22,13 @@ import {
   PriceCalendarQuery,
   PriceHistoryQuery,
 } from "./FlightSearchProvider";
+import { ProviderError } from "./errors";
 import {
   AIRLINES,
-  baggageCost,
+  childFareFactor,
   dayEpoch,
   flightNumberFor,
+  generateBaggageAllowance,
   pickAirline,
   rngFor,
   routeBasePrice,
@@ -26,16 +36,45 @@ import {
   timeSlotOf,
 } from "./mockData";
 import {
-  BaggageOption,
+  BookingInfo,
   CalendarDayPrice,
   FlightLeg,
   FlightPriceHistoryEntry,
   FlightResult,
+  PassengerConfig,
+  PassengerPriceBreakdown,
   PriceBreakdown,
+  ProviderCapabilities,
+  ProviderErrorCode,
+  ProviderRateLimit,
 } from "@/lib/types";
 
 const STOP_DURATION_PENALTY_MIN = 95; // extra minutes per connection
 const BASE_DURATION_MIN = 240; // baseline nonstop-ish duration for reference routes
+
+// Realistic-ish distribution of *which* error fires when a simulated error
+// is triggered — weighted toward the transient ones, same as a real API.
+const ERROR_CODE_WEIGHTS: [ProviderErrorCode, number][] = [
+  ["RATE_LIMITED", 0.35],
+  ["TIMEOUT", 0.3],
+  ["PROVIDER_ERROR", 0.2],
+  ["INVALID_ROUTE", 0.1],
+  ["UNKNOWN", 0.05],
+];
+
+export interface MockProviderConfig {
+  /** Probability [0,1] that any given searchFlights() call throws a simulated ProviderError. 0 by default so demo/seed data stays reliable. */
+  errorRate: number;
+  /** When set, every simulated error uses this exact code instead of the weighted random pick — lets tests exercise one specific failure path deterministically. */
+  forceErrorCode: ProviderErrorCode | null;
+  rateLimit: ProviderRateLimit;
+}
+
+const DEFAULT_CONFIG: MockProviderConfig = {
+  errorRate: 0,
+  forceErrorCode: null,
+  rateLimit: { requestsPerSecond: 8, requestsPerMinute: 200, requestsPerDay: 5000 },
+};
 
 function advanceFactor(daysUntilDeparture: number): number {
   // Very close (<7d) or very far (>300d) tends to be pricier; a broad sweet
@@ -56,9 +95,6 @@ function stopsFactor(stops: number): number {
 }
 
 function driftFactor(origin: string, destination: string, dateISO: string, epoch: number): number {
-  // Slow day-to-day market drift, independent per route, so the same query
-  // repeated "today" is stable but shifts gently over the following days —
-  // this is what makes the price history chart look like a real market.
   const rng = rngFor("drift", origin, destination, dateISO, Math.floor(epoch / 3));
   return 0.9 + rng() * 0.22;
 }
@@ -108,50 +144,126 @@ function buildLeg(
   return { leg, priceFactor };
 }
 
+/**
+ * Builds the per-passenger price breakdown. ~80% of the time the mock
+ * "provider" reports it (adult + one price per child, driven by
+ * childFareFactor); the other ~20% it only gives a lump total — exercising
+ * the pricingBreakdownAvailable=false path the same way a real API
+ * sometimes will.
+ */
+function buildPassengerPricing(
+  adultFare: number,
+  passengers: PassengerConfig,
+  currency: PassengerPriceBreakdown["currency"],
+  rng: () => number,
+): PassengerPriceBreakdown {
+  const breakdownAvailable = rng() < 0.8;
+
+  if (!breakdownAvailable) {
+    const totalFactor =
+      passengers.adults + passengers.childrenAges.reduce((sum, age) => sum + childFareFactor(age), 0);
+    return {
+      pricingBreakdownAvailable: false,
+      adultPrice: null,
+      childPrices: passengers.childrenAges.map(() => null),
+      totalPrice: Math.round(adultFare * totalFactor),
+      currency,
+    };
+  }
+
+  const adultPrice = Math.round(adultFare);
+  const childPrices = passengers.childrenAges.map((age) => Math.round(adultFare * childFareFactor(age)));
+  const totalPrice = adultPrice * passengers.adults + childPrices.reduce((sum, p) => sum + p, 0);
+
+  return { pricingBreakdownAvailable: true, adultPrice, childPrices, totalPrice, currency };
+}
+
 function buildPriceBreakdown(
-  base: number,
-  baggage: BaggageOption,
+  adultFare: number,
+  passengers: PassengerConfig,
+  currency: PassengerPriceBreakdown["currency"],
   rng: () => number,
 ): PriceBreakdown {
-  const basePrice = Math.round(base);
-  const feesKnown = rng() < 0.72;
-  const fees = feesKnown ? Math.round(basePrice * (0.06 + rng() * 0.05)) : null;
-  const bag = baggageCost(baggage, basePrice);
-  const otherKnown = rng() < 0.2;
+  const passengerPricing = buildPassengerPricing(adultFare, passengers, currency, rng);
+  const feesKnown = passengerPricing.pricingBreakdownAvailable && rng() < 0.72;
+  const fees = feesKnown ? Math.round(passengerPricing.totalPrice * (0.06 + rng() * 0.05)) : null;
+  const otherKnown = feesKnown && rng() < 0.2;
   const otherCharges = otherKnown ? Math.round(rng() * 15) : null;
 
-  const effectivePrice =
-    basePrice + (fees ?? 0) + (bag ?? 0) + (otherCharges ?? 0);
-
   return {
-    basePrice,
+    passengers: passengerPricing,
     fees,
-    baggageCost: bag,
+    baggageCost: null, // filled in by the caller once BaggageAllowance is known
     otherCharges,
-    effectivePrice,
-    currency: "USD",
+    effectivePrice: passengerPricing.totalPrice + (fees ?? 0) + (otherCharges ?? 0),
+    currency,
   };
+}
+
+function pickErrorCode(rng: () => number): ProviderErrorCode {
+  const roll = rng();
+  let acc = 0;
+  for (const [code, weight] of ERROR_CODE_WEIGHTS) {
+    acc += weight;
+    if (roll < acc) return code;
+  }
+  return "UNKNOWN";
+}
+
+function hashPart(...parts: string[]): string {
+  return parts
+    .join("-")
+    .replace(/[^a-zA-Z0-9-]/g, "")
+    .toLowerCase()
+    .slice(0, 60);
 }
 
 class MockFlightProviderImpl implements FlightSearchProvider {
   readonly id = "mock" as const;
   readonly label = "Mock Flight Provider (datos simulados)";
   readonly isMock = true;
+  readonly capabilities: ProviderCapabilities = {
+    supportsPriceCalendar: true,
+    supportsFlexibleDates: true,
+    supportsMultipleAirports: true,
+    supportsExactFlightSearch: true,
+    supportsBookingLinks: true,
+    supportsPassengerPricing: true,
+  };
 
+  private config: MockProviderConfig = { ...DEFAULT_CONFIG };
   private resultsCache = new Map<string, FlightResult>();
 
+  get rateLimit(): ProviderRateLimit {
+    return this.config.rateLimit;
+  }
+
+  /** Lets the running app or a test dial in error rate / rate limit without touching the demo defaults elsewhere. */
+  configure(patch: Partial<MockProviderConfig>): void {
+    this.config = { ...this.config, ...patch };
+  }
+
+  resetConfig(): void {
+    this.config = { ...DEFAULT_CONFIG };
+  }
+
+  private maybeThrow(seed: string): void {
+    if (this.config.forceErrorCode) {
+      const code = this.config.forceErrorCode;
+      throw new ProviderError(code, `Error simulado forzado (${code}) para pruebas.`, code === "RATE_LIMITED" ? 10 : undefined);
+    }
+    if (this.config.errorRate <= 0) return;
+    const rng = rngFor("simulated-error", seed, Date.now().toString());
+    if (rng() < this.config.errorRate) {
+      const code = pickErrorCode(rng);
+      throw new ProviderError(code, `Error simulado (${code}) para probar manejo de errores.`, code === "RATE_LIMITED" ? 500 : undefined);
+    }
+  }
+
   async searchFlights(query: FlightSearchQuery): Promise<FlightResult[]> {
-    const {
-      origin,
-      destination,
-      departureDate,
-      returnDate,
-      tripType,
-      baggage,
-      maxStops,
-      searchId,
-      searchRunId,
-    } = query;
+    const { origin, destination, departureDate, returnDate, tripType, maxStops, searchId, searchRunId, passengers } = query;
+
+    this.maybeThrow(`searchFlights-${origin}-${destination}-${departureDate}`);
 
     const base = routeBasePrice(origin, destination);
     const epoch = dayEpoch();
@@ -165,13 +277,7 @@ class MockFlightProviderImpl implements FlightSearchProvider {
 
     for (let i = 0; i < optionCount; i++) {
       const seedTag = `out-${i}`;
-      const { leg: outbound, priceFactor: outFactor } = buildLeg(
-        origin,
-        destination,
-        departureDate,
-        maxStops,
-        seedTag,
-      );
+      const { leg: outbound, priceFactor: outFactor } = buildLeg(origin, destination, departureDate, maxStops, seedTag);
 
       let inbound: FlightLeg | null = null;
       let inFactor = 1;
@@ -185,13 +291,17 @@ class MockFlightProviderImpl implements FlightSearchProvider {
       const noise = 0.94 + rng() * 0.16;
       const combinedFactor = tripType === "round_trip" ? (outFactor + inFactor) / 2 : outFactor;
       const tripTypeFactor = tripType === "round_trip" ? 1 : 0.55;
-      const rawPrice = base * tripTypeFactor * combinedFactor * adv * drift * noise;
+      const adultFare = base * tripTypeFactor * combinedFactor * adv * drift * noise;
 
-      const baggageIncluded = rng() < (baggage === "none" ? 0.15 : 0.55);
-      const priceBreakdown = buildPriceBreakdown(rawPrice, baggage, rng);
-      priceBreakdown.currency = query.currency;
+      const priceBreakdown = buildPriceBreakdown(adultFare, passengers, query.currency, rng);
+      const baggage = generateBaggageAllowance(rng, priceBreakdown.passengers.adultPrice ?? adultFare);
+      priceBreakdown.baggageCost = baggage.addCost;
+      priceBreakdown.effectivePrice += baggage.included ? 0 : baggage.addCost ?? 0;
 
       const id = `mock-${hashPart(origin, destination, departureDate, returnDate ?? "", seedTag)}`;
+      const foundAt = new Date();
+      const expiresMinutes = 15 + Math.floor(rng() * 30);
+      const booking: BookingInfo = { type: "deep_link", url: `https://example-flight-search.invalid/book/${id}` };
 
       const flight: FlightResult = {
         id,
@@ -201,12 +311,13 @@ class MockFlightProviderImpl implements FlightSearchProvider {
         destination,
         outbound,
         inbound,
-        baggageIncluded,
-        baggageOption: baggage,
+        passengers,
+        baggage,
         price: priceBreakdown,
         source: this.id,
-        bookingUrl: `https://example-flight-search.invalid/book/${id}`,
-        foundAt: formatISO(new Date()),
+        booking,
+        expiresAt: new Date(foundAt.getTime() + expiresMinutes * 60 * 1000).toISOString(),
+        foundAt: formatISO(foundAt),
       };
 
       this.resultsCache.set(id, flight);
@@ -217,11 +328,19 @@ class MockFlightProviderImpl implements FlightSearchProvider {
   }
 
   async getFlightDetails(flightResultId: string): Promise<FlightResult | null> {
-    return this.resultsCache.get(flightResultId) ?? null;
+    const flight = this.resultsCache.get(flightResultId);
+    if (!flight) return null;
+    // Real providers can't re-fetch an expired offer by id — mirror that here
+    // instead of pretending the cached price is still valid.
+    if (flight.expiresAt && new Date(flight.expiresAt).getTime() < Date.now()) return null;
+    return flight;
   }
 
   async getPriceCalendar(query: PriceCalendarQuery): Promise<CalendarDayPrice[]> {
     const { origin, destination, dateFrom, dateTo, nights, tripType, currency } = query;
+
+    this.maybeThrow(`getPriceCalendar-${origin}-${destination}`);
+
     const start = parseISO(dateFrom);
     const end = parseISO(dateTo);
     const days = Math.max(0, differenceInCalendarDays(end, start));
@@ -241,7 +360,6 @@ class MockFlightProviderImpl implements FlightSearchProvider {
       const drift = driftFactor(origin, destination, dateISO, epoch);
       const rng = rngFor("calendar", origin, destination, dateISO, returnISO ?? "");
 
-      // Representative price: cheapest of a handful of simulated slots.
       let cheapest = Infinity;
       for (let s = 0; s < 4; s++) {
         const slotRng = rngFor("calendar-slot", origin, destination, dateISO, s);
@@ -264,11 +382,13 @@ class MockFlightProviderImpl implements FlightSearchProvider {
     const base = routeBasePrice(origin, destination);
     const entries: FlightPriceHistoryEntry[] = [];
     const today = new Date();
+    // Backfill/bootstrap history has no specific search's passenger mix yet —
+    // it represents a one-adult market reference, documented explicitly
+    // rather than silently assumed.
+    const referencePassengers: PassengerConfig = { adults: 1, childrenAges: [] };
 
     for (let d = daysBack; d >= 0; d--) {
       const observedAt = addDays(today, -d);
-      // Simulate a flight roughly 30-60 days out from each historical
-      // observation, which is a realistic booking horizon.
       const horizon = 30 + Math.floor(rngFor("hist-horizon", origin, destination, d)() * 30);
       const departureDate = addDays(observedAt, horizon);
       const departureISO = formatISO(departureDate, { representation: "date" });
@@ -279,8 +399,9 @@ class MockFlightProviderImpl implements FlightSearchProvider {
       const { leg } = buildLeg(origin, destination, departureISO, 1, `hist-${d}`);
       const factor = slotPriceFactor(origin, destination, leg.departureTimeSlot) * stopsFactor(leg.stops);
       const noise = 0.93 + rng() * 0.18;
-      const basePrice = Math.round(base * factor * adv * drift * noise);
-      const breakdown = buildPriceBreakdown(basePrice, "checked_1", rng);
+      const adultFare = base * factor * adv * drift * noise;
+      const breakdown = buildPriceBreakdown(adultFare, referencePassengers, currency, rng);
+      const baggage = generateBaggageAllowance(rng, breakdown.passengers.adultPrice ?? adultFare);
 
       entries.push({
         id: `hist-${hashPart(origin, destination, String(d))}`,
@@ -297,10 +418,9 @@ class MockFlightProviderImpl implements FlightSearchProvider {
         returnTime: null,
         stops: leg.stops,
         durationMinutes: leg.durationMinutes,
-        baggage: "checked_1",
-        basePrice: breakdown.basePrice,
-        fees: breakdown.fees,
-        baggageCost: breakdown.baggageCost,
+        baggage,
+        passengers: referencePassengers,
+        pricingBreakdownAvailable: breakdown.passengers.pricingBreakdownAvailable,
         effectivePrice: breakdown.effectivePrice,
         currency,
         source: this.id,
@@ -310,14 +430,6 @@ class MockFlightProviderImpl implements FlightSearchProvider {
 
     return entries;
   }
-}
-
-function hashPart(...parts: string[]): string {
-  return parts
-    .join("-")
-    .replace(/[^a-zA-Z0-9-]/g, "")
-    .toLowerCase()
-    .slice(0, 60);
 }
 
 export const mockFlightProvider = new MockFlightProviderImpl();

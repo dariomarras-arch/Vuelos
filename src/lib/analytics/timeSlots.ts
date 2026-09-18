@@ -5,7 +5,7 @@
 // discover its own pattern statistically.
 // ---------------------------------------------------------------------------
 
-import { FlightResult, TIME_SLOTS, TimeSlotKey, TimeSlotStat } from "@/lib/types";
+import { FlightResult, referenceUnitPrice, TIME_SLOTS, TimeSlotKey, TimeSlotStat } from "@/lib/types";
 import { mean, round2 } from "./stats";
 
 export function aggregateTimeSlots(
@@ -18,7 +18,8 @@ export function aggregateTimeSlots(
   for (const flight of flights) {
     const l = leg === "outbound" ? flight.outbound : flight.inbound;
     if (!l) continue;
-    bySlot.get(l.departureTimeSlot)?.push(flight.price.effectivePrice);
+    // Per-adult reference price — comparable with target/average/calendar prices (see referenceUnitPrice).
+    bySlot.get(l.departureTimeSlot)?.push(referenceUnitPrice(flight));
   }
 
   return TIME_SLOTS.map((slot) => {

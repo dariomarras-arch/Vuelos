@@ -4,16 +4,26 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   BaggageOption,
+  CACHE_TTL_OPTIONS,
+  CacheTtlHours,
   CurrencyCode,
   FLEXIBILITY_OPTIONS,
   FlexibilityDays,
   FlightSearch,
   MAX_STOPS_OPTIONS,
   NewFlightSearch,
+  ScheduleMode,
   TIME_SLOTS,
   TimeSlotKey,
   TripType,
 } from "@/lib/types";
+
+function parseAges(input: string): number[] {
+  return input
+    .split(/[\s,]+/)
+    .map((a) => Number(a.trim()))
+    .filter((a) => Number.isFinite(a) && a >= 0 && a < 18);
+}
 
 const BAGGAGE_LABELS: Record<BaggageOption, string> = {
   none: "Sin equipaje",
@@ -41,15 +51,18 @@ type FormState = {
   maxNights: number;
   flexibilityDays: FlexibilityDays;
   adults: number;
-  children: number;
-  baggage: BaggageOption;
+  childrenAges: string;
+  baggageRequirement: BaggageOption;
   maxStops: 0 | 1 | 2;
   targetPrice: number;
   maxPrice: number;
   currency: CurrencyCode;
-  scheduleMode: "any" | "preferred";
+  scheduleMode: ScheduleMode;
   departurePreferredSlots: TimeSlotKey[];
   returnPreferredSlots: TimeSlotKey[];
+  maxRequestsPerRun: number;
+  maxRequestsPerDay: number;
+  cacheTtlHours: CacheTtlHours;
 };
 
 function initialState(existing?: FlightSearch): FormState {
@@ -66,8 +79,8 @@ function initialState(existing?: FlightSearch): FormState {
       maxNights: existing.maxNights,
       flexibilityDays: existing.flexibilityDays,
       adults: existing.passengers.adults,
-      children: existing.passengers.children,
-      baggage: existing.baggage,
+      childrenAges: existing.passengers.childrenAges.join(", "),
+      baggageRequirement: existing.baggageRequirement,
       maxStops: existing.maxStops,
       targetPrice: existing.targetPrice,
       maxPrice: existing.maxPrice,
@@ -75,6 +88,9 @@ function initialState(existing?: FlightSearch): FormState {
       scheduleMode: existing.schedule.mode,
       departurePreferredSlots: existing.schedule.departurePreferredSlots ?? [],
       returnPreferredSlots: existing.schedule.returnPreferredSlots ?? [],
+      maxRequestsPerRun: existing.requestBudget.maxRequestsPerRun,
+      maxRequestsPerDay: existing.requestBudget.maxRequestsPerDay,
+      cacheTtlHours: existing.cacheTtlHours,
     };
   }
   return {
@@ -89,8 +105,8 @@ function initialState(existing?: FlightSearch): FormState {
     maxNights: 14,
     flexibilityDays: 3,
     adults: 1,
-    children: 0,
-    baggage: "checked_1",
+    childrenAges: "",
+    baggageRequirement: "checked_1",
     maxStops: 1,
     targetPrice: 700,
     maxPrice: 850,
@@ -98,6 +114,9 @@ function initialState(existing?: FlightSearch): FormState {
     scheduleMode: "any",
     departurePreferredSlots: [],
     returnPreferredSlots: [],
+    maxRequestsPerRun: 100,
+    maxRequestsPerDay: 300,
+    cacheTtlHours: 12,
   };
 }
 
@@ -113,17 +132,19 @@ function toPayload(form: FormState): NewFlightSearch {
     minNights: Number(form.minNights),
     maxNights: Number(form.maxNights),
     flexibilityDays: form.flexibilityDays,
-    passengers: { adults: Number(form.adults), children: Number(form.children) },
-    baggage: form.baggage,
+    passengers: { adults: Number(form.adults), childrenAges: parseAges(form.childrenAges) },
+    baggageRequirement: form.baggageRequirement,
     maxStops: form.maxStops,
     targetPrice: Number(form.targetPrice),
     maxPrice: Number(form.maxPrice),
     currency: form.currency,
     schedule: {
       mode: form.scheduleMode,
-      departurePreferredSlots: form.scheduleMode === "preferred" ? form.departurePreferredSlots : undefined,
-      returnPreferredSlots: form.scheduleMode === "preferred" ? form.returnPreferredSlots : undefined,
+      departurePreferredSlots: form.scheduleMode !== "any" ? form.departurePreferredSlots : undefined,
+      returnPreferredSlots: form.scheduleMode !== "any" ? form.returnPreferredSlots : undefined,
     },
+    requestBudget: { maxRequestsPerRun: Number(form.maxRequestsPerRun), maxRequestsPerDay: Number(form.maxRequestsPerDay) },
+    cacheTtlHours: form.cacheTtlHours,
   };
 }
 
@@ -278,18 +299,24 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
           />
         </div>
         <div>
-          <label className="label">Niños</label>
+          <label className="label">Niños (edad de cada uno)</label>
           <input
-            type="number"
-            min={0}
             className="input"
-            value={form.children}
-            onChange={(e) => set("children", Number(e.target.value))}
+            placeholder="10, 6, 4"
+            value={form.childrenAges}
+            onChange={(e) => set("childrenAges", e.target.value)}
           />
+          <p className="mt-1 text-[11px] text-base-500">
+            La edad se usa para estimar tarifa infantil cuando el proveedor la informa por separado.
+          </p>
         </div>
         <div>
           <label className="label">Equipaje</label>
-          <select className="input" value={form.baggage} onChange={(e) => set("baggage", e.target.value as BaggageOption)}>
+          <select
+            className="input"
+            value={form.baggageRequirement}
+            onChange={(e) => set("baggageRequirement", e.target.value as BaggageOption)}
+          >
             {Object.entries(BAGGAGE_LABELS).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
@@ -311,7 +338,7 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
 
       <div className="card card-pad grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div>
-          <label className="label">Precio objetivo</label>
+          <label className="label">Precio objetivo (por adulto)</label>
           <input
             type="number"
             min={0}
@@ -321,7 +348,7 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
           />
         </div>
         <div>
-          <label className="label">Precio máximo</label>
+          <label className="label">Precio máximo (por adulto)</label>
           <input
             type="number"
             min={0}
@@ -329,6 +356,9 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
             value={form.maxPrice}
             onChange={(e) => set("maxPrice", Number(e.target.value))}
           />
+          <p className="mt-1 text-[11px] text-base-500">
+            Se compara contra la tarifa de referencia por adulto — el total para todos los pasajeros se muestra aparte.
+          </p>
         </div>
         <div>
           <label className="label">Moneda</label>
@@ -341,7 +371,7 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
 
       <div className="card card-pad">
         <label className="label">Horarios</label>
-        <div className="mb-3 flex gap-4 text-sm text-base-300">
+        <div className="mb-3 flex flex-wrap gap-4 text-sm text-base-300">
           <label className="flex items-center gap-2">
             <input
               type="radio"
@@ -358,10 +388,19 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
               checked={form.scheduleMode === "preferred"}
               onChange={() => set("scheduleMode", "preferred")}
             />
-            Horario preferido
+            Preferencia (prioriza estas franjas, no descarta el resto)
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="scheduleMode"
+              checked={form.scheduleMode === "strict"}
+              onChange={() => set("scheduleMode", "strict")}
+            />
+            Restricción (solo acepta estas franjas)
           </label>
         </div>
-        {form.scheduleMode === "preferred" && (
+        {form.scheduleMode !== "any" && (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <div className="mb-1.5 text-xs text-base-400">Franjas preferidas de ida</div>
@@ -403,6 +442,47 @@ export function SearchForm({ existing }: { existing?: FlightSearch }) {
             </div>
           </div>
         )}
+      </div>
+
+      <div className="card card-pad grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div>
+          <label className="label">Máximo de requests por corrida</label>
+          <input
+            type="number"
+            min={1}
+            className="input"
+            value={form.maxRequestsPerRun}
+            onChange={(e) => set("maxRequestsPerRun", Number(e.target.value))}
+          />
+        </div>
+        <div>
+          <label className="label">Máximo de requests por día</label>
+          <input
+            type="number"
+            min={1}
+            className="input"
+            value={form.maxRequestsPerDay}
+            onChange={(e) => set("maxRequestsPerDay", Number(e.target.value))}
+          />
+        </div>
+        <div>
+          <label className="label">Vigencia del cache (TTL)</label>
+          <select
+            className="input"
+            value={form.cacheTtlHours}
+            onChange={(e) => set("cacheTtlHours", Number(e.target.value) as CacheTtlHours)}
+          >
+            {CACHE_TTL_OPTIONS.map((h) => (
+              <option key={h} value={h}>
+                {h} horas
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="text-[11px] text-base-500 sm:col-span-3">
+          El motor nunca supera estos límites. Una búsqueda ya consultada dentro del TTL se reutiliza desde cache en vez de
+          generar un request nuevo.
+        </p>
       </div>
 
       {error && <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-300">{error}</div>}

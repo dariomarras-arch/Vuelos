@@ -12,6 +12,8 @@ import {
   FlightSearch,
   NewFlightSearch,
   NotificationSetting,
+  ProviderCacheEntry,
+  RequestLogEntry,
   SearchRun,
 } from "@/lib/types";
 import { Repository } from "./repository";
@@ -33,8 +35,8 @@ function searchToRow(userId: string, s: NewFlightSearch | FlightSearch) {
     max_nights: s.maxNights,
     flexibility_days: s.flexibilityDays,
     adults: s.passengers.adults,
-    children: s.passengers.children,
-    baggage: s.baggage,
+    children_ages: s.passengers.childrenAges,
+    baggage_requirement: s.baggageRequirement,
     max_stops: s.maxStops,
     target_price: s.targetPrice,
     max_price: s.maxPrice,
@@ -42,6 +44,9 @@ function searchToRow(userId: string, s: NewFlightSearch | FlightSearch) {
     schedule_mode: s.schedule.mode,
     departure_preferred_slots: s.schedule.departurePreferredSlots ?? null,
     return_preferred_slots: s.schedule.returnPreferredSlots ?? null,
+    max_requests_per_run: s.requestBudget.maxRequestsPerRun,
+    max_requests_per_day: s.requestBudget.maxRequestsPerDay,
+    cache_ttl_hours: s.cacheTtlHours,
     status: s.status ?? "active",
   };
 }
@@ -60,8 +65,8 @@ function rowToSearch(row: any): FlightSearch {
     minNights: row.min_nights,
     maxNights: row.max_nights,
     flexibilityDays: row.flexibility_days,
-    passengers: { adults: row.adults, children: row.children },
-    baggage: row.baggage,
+    passengers: { adults: row.adults, childrenAges: row.children_ages ?? [] },
+    baggageRequirement: row.baggage_requirement,
     maxStops: row.max_stops,
     targetPrice: Number(row.target_price),
     maxPrice: Number(row.max_price),
@@ -71,6 +76,8 @@ function rowToSearch(row: any): FlightSearch {
       departurePreferredSlots: row.departure_preferred_slots ?? undefined,
       returnPreferredSlots: row.return_preferred_slots ?? undefined,
     },
+    requestBudget: { maxRequestsPerRun: row.max_requests_per_run, maxRequestsPerDay: row.max_requests_per_day },
+    cacheTtlHours: row.cache_ttl_hours,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -92,6 +99,10 @@ function runToRow(r: Omit<SearchRun, "id"> & { id?: string }) {
     alerts_sent: r.alertsSent,
     status: r.status,
     error_message: r.errorMessage,
+    requests_used: r.requestsUsed,
+    cache_hits: r.cacheHits,
+    errors_by_code: r.errorsByCode,
+    budget_exhausted: r.budgetExhausted,
   };
 }
 
@@ -107,6 +118,10 @@ function rowToRun(row: any): SearchRun {
     alertsSent: row.alerts_sent,
     status: row.status,
     errorMessage: row.error_message,
+    requestsUsed: row.requests_used ?? 0,
+    cacheHits: row.cache_hits ?? 0,
+    errorsByCode: row.errors_by_code ?? {},
+    budgetExhausted: row.budget_exhausted ?? false,
   };
 }
 
@@ -119,16 +134,14 @@ function resultToRow(r: FlightResult) {
     destination: r.destination,
     outbound: r.outbound,
     inbound: r.inbound,
-    baggage_included: r.baggageIncluded,
-    baggage_option: r.baggageOption,
-    base_price: r.price.basePrice,
-    fees: r.price.fees,
-    baggage_cost: r.price.baggageCost,
-    other_charges: r.price.otherCharges,
+    passengers: r.passengers,
+    baggage: r.baggage,
+    price: r.price,
     effective_price: r.price.effectivePrice,
     currency: r.price.currency,
     source: r.source,
-    booking_url: r.bookingUrl,
+    booking: r.booking,
+    expires_at: r.expiresAt,
     found_at: r.foundAt,
   };
 }
@@ -142,18 +155,12 @@ function rowToResult(row: any): FlightResult {
     destination: row.destination,
     outbound: row.outbound,
     inbound: row.inbound,
-    baggageIncluded: row.baggage_included,
-    baggageOption: row.baggage_option,
-    price: {
-      basePrice: Number(row.base_price),
-      fees: row.fees === null ? null : Number(row.fees),
-      baggageCost: row.baggage_cost === null ? null : Number(row.baggage_cost),
-      otherCharges: row.other_charges === null ? null : Number(row.other_charges),
-      effectivePrice: Number(row.effective_price),
-      currency: row.currency,
-    },
+    passengers: row.passengers,
+    baggage: row.baggage,
+    price: row.price,
     source: row.source,
-    bookingUrl: row.booking_url,
+    booking: row.booking,
+    expiresAt: row.expires_at,
     foundAt: row.found_at,
   };
 }
@@ -175,9 +182,8 @@ function historyToRow(e: FlightPriceHistoryEntry) {
     stops: e.stops,
     duration_minutes: e.durationMinutes,
     baggage: e.baggage,
-    base_price: e.basePrice,
-    fees: e.fees,
-    baggage_cost: e.baggageCost,
+    passengers: e.passengers,
+    pricing_breakdown_available: e.pricingBreakdownAvailable,
     effective_price: e.effectivePrice,
     currency: e.currency,
     source: e.source,
@@ -202,9 +208,8 @@ function rowToHistory(row: any): FlightPriceHistoryEntry {
     stops: row.stops,
     durationMinutes: row.duration_minutes,
     baggage: row.baggage,
-    basePrice: Number(row.base_price),
-    fees: row.fees === null ? null : Number(row.fees),
-    baggageCost: row.baggage_cost === null ? null : Number(row.baggage_cost),
+    passengers: row.passengers,
+    pricingBreakdownAvailable: row.pricing_breakdown_available,
     effectivePrice: Number(row.effective_price),
     currency: row.currency,
     source: row.source,
@@ -245,9 +250,11 @@ function alertToRow(a: Omit<Alert, "id">) {
     destination: a.destination,
     departure_date: a.departureDate,
     return_date: a.returnDate,
-    price_per_pax: a.pricePerPax,
-    total_price: a.totalPrice,
     passengers: a.passengers,
+    total_price: a.totalPrice,
+    pricing_breakdown_available: a.pricingBreakdownAvailable,
+    adult_price: a.adultPrice,
+    child_prices: a.childPrices,
     currency: a.currency,
     average_price: a.averagePrice,
     variation_percent: a.variationPercent,
@@ -270,9 +277,11 @@ function rowToAlert(row: any): Alert {
     destination: row.destination,
     departureDate: row.departure_date,
     returnDate: row.return_date,
-    pricePerPax: Number(row.price_per_pax),
-    totalPrice: Number(row.total_price),
     passengers: row.passengers,
+    totalPrice: Number(row.total_price),
+    pricingBreakdownAvailable: row.pricing_breakdown_available,
+    adultPrice: row.adult_price === null ? null : Number(row.adult_price),
+    childPrices: (row.child_prices ?? []).map((p: number | null) => (p === null ? null : Number(p))),
     currency: row.currency,
     averagePrice: row.average_price === null ? null : Number(row.average_price),
     variationPercent: row.variation_percent === null ? null : Number(row.variation_percent),
@@ -282,6 +291,51 @@ function rowToAlert(row: any): Alert {
     message: row.message,
     status: row.status,
     dedupeKey: row.dedupe_key,
+  };
+}
+
+function cacheToRow(e: ProviderCacheEntry) {
+  return {
+    key: e.key,
+    endpoint: e.endpoint,
+    payload: e.payload,
+    created_at: e.createdAt,
+    expires_at: e.expiresAt,
+  };
+}
+
+function rowToCache(row: any): ProviderCacheEntry {
+  return {
+    key: row.key,
+    endpoint: row.endpoint,
+    payload: row.payload,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function requestLogToRow(e: Omit<RequestLogEntry, "id">) {
+  return {
+    search_id: e.searchId,
+    search_run_id: e.searchRunId,
+    timestamp: e.timestamp,
+    endpoint: e.endpoint,
+    outcome: e.outcome,
+    error_code: e.errorCode,
+    cache_key: e.cacheKey,
+  };
+}
+
+function rowToRequestLog(row: any): RequestLogEntry {
+  return {
+    id: row.id,
+    searchId: row.search_id,
+    searchRunId: row.search_run_id,
+    timestamp: row.timestamp,
+    endpoint: row.endpoint,
+    outcome: row.outcome,
+    errorCode: row.error_code,
+    cacheKey: row.cache_key,
   };
 }
 
@@ -441,6 +495,36 @@ export class SupabaseRepository implements Repository {
       .maybeSingle();
     if (error) throw error;
     return data ? rowToAlert(data) : null;
+  }
+
+  async getCacheEntry(key: string): Promise<ProviderCacheEntry | null> {
+    const { data, error } = await this.client.from("provider_cache").select("*").eq("key", key).maybeSingle();
+    if (error) throw error;
+    return data ? rowToCache(data) : null;
+  }
+
+  async setCacheEntry(entry: ProviderCacheEntry): Promise<void> {
+    const { error } = await this.client.from("provider_cache").upsert(cacheToRow(entry), { onConflict: "key" });
+    if (error) throw error;
+  }
+
+  async logRequest(entry: Omit<RequestLogEntry, "id">): Promise<RequestLogEntry> {
+    const { data, error } = await this.client.from("request_log").insert(requestLogToRow(entry)).select("*").single();
+    if (error) throw error;
+    return rowToRequestLog(data);
+  }
+
+  async listRequestLog(params: { searchId?: string; sinceISO?: string; limit?: number }): Promise<RequestLogEntry[]> {
+    let query = this.client
+      .from("request_log")
+      .select("*")
+      .order("timestamp", { ascending: false })
+      .limit(params.limit ?? 5000);
+    if (params.searchId) query = query.eq("search_id", params.searchId);
+    if (params.sinceISO) query = query.gte("timestamp", params.sinceISO);
+    const { data, error } = await query;
+    if (error) throw error;
+    return (data ?? []).map(rowToRequestLog);
   }
 }
 

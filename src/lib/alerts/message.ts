@@ -7,7 +7,7 @@
 
 import { format, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
-import { Alert, FlightResult, RuleId } from "@/lib/types";
+import { FlightResult, RuleId, passengerCount } from "@/lib/types";
 
 const RULE_REASONS: Partial<Record<RuleId, string>> = {
   A: "Debajo del precio objetivo",
@@ -32,23 +32,50 @@ export function reasonLabelsFor(passedRuleIds: RuleId[]): string[] {
   return passedRuleIds.map((id) => RULE_REASONS[id]).filter((x): x is string => Boolean(x));
 }
 
+function passengerLine(flight: FlightResult): string {
+  const { adults, childrenAges } = flight.passengers;
+  const parts = [`${adults} adulto${adults === 1 ? "" : "s"}`];
+  if (childrenAges.length > 0) parts.push(`${childrenAges.length} niño${childrenAges.length === 1 ? "" : "s"}`);
+  return parts.join(", ");
+}
+
+function bookingLine(flight: FlightResult): string[] {
+  switch (flight.booking.type) {
+    case "deep_link":
+    case "search_link":
+      return ["", "Ver vuelo:", flight.booking.url];
+    case "api_order":
+      return ["", "Reserva disponible vía la plataforma (sin enlace directo)."];
+    case "unavailable":
+      return [];
+  }
+}
+
 export interface AlertMessageInput {
   flight: FlightResult;
-  passengers: number;
   averagePrice: number | null;
   variationPercent: number | null;
   passedRuleIds: RuleId[];
 }
 
 export function buildAlertMessage(input: AlertMessageInput): string {
-  const { flight, passengers, averagePrice, variationPercent, passedRuleIds } = input;
-  const price = flight.price.effectivePrice;
-  const currency = flight.price.currency;
-  const total = Math.round(price * passengers);
+  const { flight, averagePrice, variationPercent, passedRuleIds } = input;
+  const { price } = flight;
+  const currency = price.currency;
   const stops = flight.outbound.stops + (flight.inbound?.stops ?? 0);
   const returnDate = flight.inbound ? fmtDate(flight.inbound.departureDateTime) : null;
 
   const reasons = reasonLabelsFor(passedRuleIds).map((r) => `✓ ${r}`);
+
+  const priceLines: string[] = [`Total estimado (${passengerCount(flight.passengers)} pasajeros):`, `${currency} ${Math.round(price.effectivePrice).toLocaleString("es-AR")}`];
+  if (price.passengers.pricingBreakdownAvailable && price.passengers.adultPrice !== null) {
+    priceLines.push(`(adulto: ${currency} ${Math.round(price.passengers.adultPrice)} c/u)`);
+  } else {
+    priceLines.push("(el proveedor no informó desglose por pasajero — total de la reserva)");
+  }
+
+  const baggageLabel =
+    flight.baggage.included === null ? "Equipaje: no informado" : flight.baggage.included ? "Equipaje incluido" : "Equipaje no incluido";
 
   const lines = [
     "✈️ OPORTUNIDAD DE VUELO",
@@ -57,14 +84,11 @@ export function buildAlertMessage(input: AlertMessageInput): string {
     "",
     returnDate ? `${fmtDate(flight.outbound.departureDateTime)} → ${returnDate}` : fmtDate(flight.outbound.departureDateTime),
     "",
-    `${passengers} pasajero${passengers === 1 ? "" : "s"}`,
-    `${currency} ${Math.round(price)} por pasajero`,
-    "",
-    `Total estimado:`,
-    `${currency} ${total.toLocaleString("es-AR")}`,
+    passengerLine(flight),
+    ...priceLines,
     "",
     `${stops} escala${stops === 1 ? "" : "s"}`,
-    flight.baggageIncluded ? "Equipaje incluido" : "Equipaje no incluido",
+    baggageLabel,
   ];
 
   if (averagePrice !== null) {
@@ -78,7 +102,7 @@ export function buildAlertMessage(input: AlertMessageInput): string {
     lines.push("", "Motivos:", ...reasons);
   }
 
-  lines.push("", "Ver vuelo:", flight.bookingUrl);
+  lines.push(...bookingLine(flight));
 
   return lines.join("\n");
 }

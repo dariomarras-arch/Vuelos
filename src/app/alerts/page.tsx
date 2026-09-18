@@ -55,7 +55,7 @@ export default async function AlertsPage({ searchParams }: { searchParams: { sea
                     {a.origin} → {a.destination}
                   </td>
                   <td className="px-4 py-2.5 text-base-400">{searchNames.get(a.searchId) ?? "—"}</td>
-                  <td className="px-4 py-2.5 text-right font-medium text-base-100">{money(a.pricePerPax, a.currency)}</td>
+                  <td className="px-4 py-2.5 text-right font-medium text-base-100">{money(a.totalPrice, a.currency)}</td>
                   <td className="px-4 py-2.5 text-right text-base-400">{money(a.averagePrice, a.currency)}</td>
                   <td className={`px-4 py-2.5 text-right ${(a.variationPercent ?? 0) < 0 ? "text-emerald-400" : "text-red-400"}`}>
                     {pct(a.variationPercent)}

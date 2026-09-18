@@ -21,6 +21,8 @@ import {
   FlightSearch,
   NewFlightSearch,
   NotificationSetting,
+  ProviderCacheEntry,
+  RequestLogEntry,
   SearchRun,
 } from "@/lib/types";
 
@@ -54,4 +56,12 @@ export interface Repository {
   listAlerts(searchId?: string): Promise<Alert[]>;
   createAlert(alert: Omit<Alert, "id">): Promise<Alert>;
   findAlertByDedupeKey(dedupeKey: string): Promise<Alert | null>;
+
+  // Provider request cache (dedup layer) ---------------------------------------
+  getCacheEntry(key: string): Promise<ProviderCacheEntry | null>;
+  setCacheEntry(entry: ProviderCacheEntry): Promise<void>;
+
+  // Request log (request budget + API usage dashboard) -------------------------
+  logRequest(entry: Omit<RequestLogEntry, "id">): Promise<RequestLogEntry>;
+  listRequestLog(params: { searchId?: string; sinceISO?: string; limit?: number }): Promise<RequestLogEntry[]>;
 }

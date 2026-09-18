@@ -1,11 +1,13 @@
 import Link from "next/link";
-import { BestCombination } from "@/lib/types";
+import { BestCombination, passengerCount, referenceUnitPrice } from "@/lib/types";
 import { OpportunityBadge } from "@/components/ui/OpportunityBadge";
 import { fullDate, money, pct } from "@/lib/utils/format";
 
 export function OpportunityCard({ combo }: { combo: BestCombination }) {
   const { flightResult: flight, opportunity } = combo;
   const stops = flight.outbound.stops + (flight.inbound?.stops ?? 0);
+  const unitPrice = referenceUnitPrice(flight);
+  const pax = passengerCount(flight.passengers);
 
   return (
     <div className="card card-pad flex flex-col gap-3">
@@ -23,7 +25,12 @@ export function OpportunityCard({ combo }: { combo: BestCombination }) {
       </div>
 
       <div>
-        <div className="text-2xl font-bold text-base-50">{money(flight.price.effectivePrice, flight.price.currency)}</div>
+        <div className="text-2xl font-bold text-base-50">{money(unitPrice, flight.price.currency)}</div>
+        {pax > 1 && (
+          <div className="text-xs text-base-500">
+            por pasajero · Total {pax}: {money(flight.price.effectivePrice, flight.price.currency)}
+          </div>
+        )}
         {opportunity.vsAverage !== null && (
           <div className={opportunity.vsAverage < 0 ? "text-sm text-emerald-400" : "text-sm text-red-400"}>
             {opportunity.vsAverage < 0 ? "↓" : "↑"} {pct(Math.abs(opportunity.vsAverage)).replace("+", "")} vs. promedio
@@ -33,7 +40,13 @@ export function OpportunityCard({ combo }: { combo: BestCombination }) {
 
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-base-400">
         <span>{stops === 0 ? "Vuelo directo" : `${stops} escala${stops > 1 ? "s" : ""}`}</span>
-        <span>{flight.baggageIncluded ? "Equipaje incluido" : "Sin equipaje incluido"}</span>
+        <span>
+          {flight.baggage.included === null
+            ? "Equipaje: no informado"
+            : flight.baggage.included
+              ? "Equipaje incluido"
+              : "Sin equipaje incluido"}
+        </span>
       </div>
 
       <Link href={`/searches/${flight.searchId}`} className="btn-secondary mt-1 w-full text-xs">

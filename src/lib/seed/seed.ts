@@ -15,7 +15,7 @@ import { getActiveProvider } from "@/lib/providers";
 import { buildRoutes } from "@/lib/engine/combinations";
 import { runSearch } from "@/lib/engine/runSearch";
 import { DEMO_USER_ID } from "@/lib/constants";
-import { FlightSearch, NewFlightSearch } from "@/lib/types";
+import { DEFAULT_REQUEST_BUDGET, FlightSearch, NewFlightSearch } from "@/lib/types";
 
 const SEARCH_1: NewFlightSearch = {
   name: "Miami / Orlando Noviembre",
@@ -28,13 +28,15 @@ const SEARCH_1: NewFlightSearch = {
   minNights: 8,
   maxNights: 12,
   flexibilityDays: 5,
-  passengers: { adults: 2, children: 3 },
-  baggage: "checked_1",
+  passengers: { adults: 2, childrenAges: [10, 6, 4] },
+  baggageRequirement: "checked_1",
   maxStops: 1,
   targetPrice: 750,
   maxPrice: 850,
   currency: "USD",
   schedule: { mode: "any" },
+  requestBudget: DEFAULT_REQUEST_BUDGET,
+  cacheTtlHours: 12,
 };
 
 const SEARCH_2: NewFlightSearch = {
@@ -48,13 +50,15 @@ const SEARCH_2: NewFlightSearch = {
   minNights: 10,
   maxNights: 14,
   flexibilityDays: 3,
-  passengers: { adults: 2, children: 0 },
-  baggage: "checked_1",
+  passengers: { adults: 2, childrenAges: [] },
+  baggageRequirement: "checked_1",
   maxStops: 1,
   targetPrice: 700,
   maxPrice: 800,
   currency: "USD",
   schedule: { mode: "any" },
+  requestBudget: DEFAULT_REQUEST_BUDGET,
+  cacheTtlHours: 12,
 };
 
 async function backfillHistory(search: FlightSearch) {

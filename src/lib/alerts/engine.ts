@@ -10,6 +10,7 @@ import {
   FlightResult,
   NotificationSetting,
   OpportunityEvaluation,
+  referenceUnitPrice,
 } from "@/lib/types";
 import { buildDedupeKey } from "./dedup";
 import { buildAlertMessage, reasonSummaryFor } from "./message";
@@ -21,7 +22,8 @@ export function isOpportunity(evaluation: OpportunityEvaluation): boolean {
   return OPPORTUNITY_LEVELS.has(evaluation.level) && evaluation.passedRuleIds.length >= 2;
 }
 
-function matchesChannel(setting: NotificationSetting, evaluation: OpportunityEvaluation, price: number): boolean {
+/** `unitPrice` is the per-adult reference price — same basis as `minimumPrice`, which the user configures alongside targetPrice/maxPrice. */
+function matchesChannel(setting: NotificationSetting, evaluation: OpportunityEvaluation, unitPrice: number): boolean {
   if (!setting.enabled) return false;
   // "Solo precio excepcional" is a hard filter on scope, not one trigger among others.
   if (setting.exceptionalOnly && evaluation.level !== "EXCEPCIONAL") return false;
@@ -32,7 +34,7 @@ function matchesChannel(setting: NotificationSetting, evaluation: OpportunityEva
   if (!priceThresholdSet && !dropThresholdSet) return true; // no extra threshold — any opportunity notifies
 
   // Independent checkboxes read as "notify me if ANY of these conditions hold".
-  const priceMatches = priceThresholdSet && price <= (setting.minimumPrice as number);
+  const priceMatches = priceThresholdSet && unitPrice <= (setting.minimumPrice as number);
   const dropMatches =
     dropThresholdSet && evaluation.vsAverage !== null && evaluation.vsAverage <= -(setting.minimumDropPercent as number);
 
@@ -42,7 +44,6 @@ function matchesChannel(setting: NotificationSetting, evaluation: OpportunityEva
 export interface AlertGenerationParams {
   flight: FlightResult;
   evaluation: OpportunityEvaluation;
-  passengers: number;
   averagePrice: number | null;
 }
 
@@ -56,7 +57,7 @@ export async function processAlert(
   params: AlertGenerationParams,
   settings: NotificationSetting[],
 ): Promise<Alert | null> {
-  const { flight, evaluation, passengers, averagePrice } = params;
+  const { flight, evaluation, averagePrice } = params;
 
   if (!isOpportunity(evaluation)) return null;
 
@@ -65,11 +66,10 @@ export async function processAlert(
   if (existing) return null; // already alerted for this exact flight/price — never duplicate
 
   const anyChannelMatches =
-    settings.length === 0 || settings.some((s) => matchesChannel(s, evaluation, flight.price.effectivePrice));
+    settings.length === 0 || settings.some((s) => matchesChannel(s, evaluation, referenceUnitPrice(flight)));
 
   const message = buildAlertMessage({
     flight,
-    passengers,
     averagePrice,
     variationPercent: evaluation.vsAverage,
     passedRuleIds: evaluation.passedRuleIds,
@@ -83,9 +83,11 @@ export async function processAlert(
     destination: flight.destination,
     departureDate: flight.outbound.departureDateTime.slice(0, 10),
     returnDate: flight.inbound ? flight.inbound.departureDateTime.slice(0, 10) : null,
-    pricePerPax: flight.price.effectivePrice,
-    totalPrice: Math.round(flight.price.effectivePrice * passengers),
-    passengers,
+    passengers: flight.passengers,
+    totalPrice: flight.price.effectivePrice,
+    pricingBreakdownAvailable: flight.price.passengers.pricingBreakdownAvailable,
+    adultPrice: flight.price.passengers.adultPrice,
+    childPrices: flight.price.passengers.childPrices,
     currency: flight.price.currency,
     averagePrice,
     variationPercent: evaluation.vsAverage,

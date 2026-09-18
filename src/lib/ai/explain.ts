@@ -14,7 +14,7 @@
 // is insufficient" contract.
 // ---------------------------------------------------------------------------
 
-import { FlightResult, HistoricalStats, OpportunityLevel } from "@/lib/types";
+import { FlightResult, HistoricalStats, OpportunityLevel, referenceUnitPrice } from "@/lib/types";
 import { percentDiff } from "@/lib/analytics/stats";
 
 export interface AIExplanationContext {
@@ -29,7 +29,8 @@ const MIN_HISTORY_FOR_CONFIDENCE = 5;
 
 export function explainOpportunity(ctx: AIExplanationContext): string {
   const { flight, historicalStats, targetPrice } = ctx;
-  const price = flight.price.effectivePrice;
+  // Per-adult reference price — comparable with historicalStats.average, which is on the same basis.
+  const price = referenceUnitPrice(flight);
   const currency = flight.price.currency;
 
   if (historicalStats.count < MIN_HISTORY_FOR_CONFIDENCE || historicalStats.average === null) {
@@ -61,11 +62,9 @@ export function explainOpportunity(ctx: AIExplanationContext): string {
     );
   }
 
-  parts.push(
-    `Itinerario de ${durationH}h con ${stops} escala${stops === 1 ? "" : "s"}, equipaje ${
-      flight.baggageIncluded ? "incluido" : "no incluido"
-    }.`,
-  );
+  const baggageLabel =
+    flight.baggage.included === null ? "no informado" : flight.baggage.included ? "incluido" : "no incluido";
+  parts.push(`Itinerario de ${durationH}h con ${stops} escala${stops === 1 ? "" : "s"}, equipaje ${baggageLabel}.`);
 
   parts.push(price <= targetPrice ? "Está por debajo del precio objetivo configurado." : "Está por encima del precio objetivo configurado.");
 

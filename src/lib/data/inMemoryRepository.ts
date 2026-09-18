@@ -16,6 +16,8 @@ import {
   FlightSearch,
   NewFlightSearch,
   NotificationSetting,
+  ProviderCacheEntry,
+  RequestLogEntry,
   SearchRun,
 } from "@/lib/types";
 import { Repository } from "./repository";
@@ -27,6 +29,8 @@ interface Store {
   priceHistory: FlightPriceHistoryEntry[];
   notificationSettings: NotificationSetting[];
   alerts: Alert[];
+  providerCache: Map<string, ProviderCacheEntry>;
+  requestLog: RequestLogEntry[];
   seeded: boolean;
 }
 
@@ -42,6 +46,8 @@ function getStore(): Store {
       priceHistory: [],
       notificationSettings: [],
       alerts: [],
+      providerCache: new Map(),
+      requestLog: [],
       seeded: false,
     };
   }
@@ -194,6 +200,30 @@ export class InMemoryRepository implements Repository {
 
   async findAlertByDedupeKey(dedupeKey: string): Promise<Alert | null> {
     return this.store.alerts.find((a) => a.dedupeKey === dedupeKey) ?? null;
+  }
+
+  async getCacheEntry(key: string): Promise<ProviderCacheEntry | null> {
+    return this.store.providerCache.get(key) ?? null;
+  }
+
+  async setCacheEntry(entry: ProviderCacheEntry): Promise<void> {
+    this.store.providerCache.set(entry.key, entry);
+  }
+
+  async logRequest(entry: Omit<RequestLogEntry, "id">): Promise<RequestLogEntry> {
+    const created: RequestLogEntry = { ...entry, id: randomUUID() };
+    this.store.requestLog.push(created);
+    if (this.store.requestLog.length > 20000) {
+      this.store.requestLog = this.store.requestLog.slice(-20000);
+    }
+    return created;
+  }
+
+  async listRequestLog(params: { searchId?: string; sinceISO?: string; limit?: number }): Promise<RequestLogEntry[]> {
+    let rows = this.store.requestLog;
+    if (params.searchId) rows = rows.filter((r) => r.searchId === params.searchId);
+    if (params.sinceISO) rows = rows.filter((r) => r.timestamp >= params.sinceISO!);
+    return [...rows].sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, params.limit ?? 5000);
   }
 }
 

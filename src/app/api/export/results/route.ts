@@ -19,13 +19,17 @@ export async function GET(req: NextRequest) {
     departureTime: r.outbound.departureDateTime,
     returnTime: r.inbound?.departureDateTime ?? "",
     stops: r.outbound.stops + (r.inbound?.stops ?? 0),
-    baggageIncluded: r.baggageIncluded,
-    basePrice: r.price.basePrice,
+    adults: r.passengers.adults,
+    children: r.passengers.childrenAges.length,
+    baggageIncluded: r.baggage.included ?? "no informado",
+    pricingBreakdownAvailable: r.price.passengers.pricingBreakdownAvailable,
+    adultPrice: r.price.passengers.adultPrice ?? "",
     fees: r.price.fees ?? "",
     baggageCost: r.price.baggageCost ?? "",
     effectivePrice: r.price.effectivePrice,
     currency: r.price.currency,
-    bookingUrl: r.bookingUrl,
+    bookingUrl: r.booking.type === "deep_link" || r.booking.type === "search_link" ? r.booking.url : "",
+    expiresAt: r.expiresAt ?? "",
   }));
 
   const csv = toCsv(rows);

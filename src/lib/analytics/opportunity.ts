@@ -12,6 +12,7 @@ import {
   OpportunityLevel,
   RuleEvaluation,
   RuleId,
+  referenceUnitPrice,
 } from "@/lib/types";
 import { percentDiff } from "./stats";
 
@@ -36,7 +37,10 @@ const RULE_LABELS: Record<RuleId, string> = {
 
 export function evaluateRules(input: OpportunityInput): RuleEvaluation[] {
   const { flight, targetPrice, historicalStats, previousBestPrice } = input;
-  const price = flight.price.effectivePrice;
+  // All comparisons (target, historical average/min, previous-best) use the
+  // per-adult-equivalent reference price, not the party total — see
+  // referenceUnitPrice() in types.ts for why.
+  const price = referenceUnitPrice(flight);
   const stops = flight.outbound.stops + (flight.inbound?.stops ?? 0);
 
   const rules: RuleEvaluation[] = [];
@@ -84,8 +88,13 @@ export function evaluateRules(input: OpportunityInput): RuleEvaluation[] {
   rules.push({
     id: "E",
     label: RULE_LABELS.E,
-    passed: flight.baggageIncluded,
-    detail: flight.baggageIncluded ? "El precio incluye equipaje." : "El equipaje no está incluido en este precio.",
+    passed: flight.baggage.included === true,
+    detail:
+      flight.baggage.included === null
+        ? "Equipaje: no informado por el proveedor."
+        : flight.baggage.included
+          ? "El precio incluye equipaje."
+          : "El equipaje no está incluido en este precio.",
   });
 
   rules.push({
@@ -174,7 +183,7 @@ export function buildExplanation(
 
 export function evaluateOpportunity(input: OpportunityInput): OpportunityEvaluation {
   const { flight, targetPrice, historicalStats } = input;
-  const price = flight.price.effectivePrice;
+  const price = referenceUnitPrice(flight);
 
   const vsTarget = percentDiff(price, targetPrice);
   const vsAverage = percentDiff(price, historicalStats.average);

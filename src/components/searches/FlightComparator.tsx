@@ -25,7 +25,10 @@ export function FlightComparator({ flights }: { flights: FlightResult[] }) {
   const rows: { label: string; render: (f: FlightResult) => React.ReactNode }[] = [
     { label: "Precio", render: (f) => <span className="font-semibold text-base-50">{money(f.price.effectivePrice, f.price.currency)}</span> },
     { label: "Aerolínea", render: (f) => f.outbound.airline },
-    { label: "Equipaje", render: (f) => (f.baggageIncluded ? "Sí" : "No") },
+    {
+      label: "Equipaje",
+      render: (f) => (f.baggage.included === null ? "No informado" : f.baggage.included ? "Sí" : "No"),
+    },
     { label: "Escalas", render: (f) => f.outbound.stops + (f.inbound?.stops ?? 0) },
     {
       label: "Duración",

@@ -1,23 +1,38 @@
 -- ============================================================================
--- FLIGHT HUNTER — Supabase / PostgreSQL schema
+-- FLIGHT HUNTER — Supabase / PostgreSQL schema (v2 — efficient search engine)
 -- ============================================================================
 -- Run this once against a fresh Supabase project (SQL editor, or
 -- `supabase db push` / psql). It is idempotent-ish (uses IF NOT EXISTS /
 -- CREATE OR REPLACE where possible) so it can be re-run safely during setup.
 --
--- Design notes:
+-- v2 changes vs. the original schema:
+--   * flight_searches: `children` (int) -> `children_ages` (int[]), because
+--     real fares are priced per passenger AGE, not per headcount.
+--     `baggage` -> `baggage_requirement` (it's a post-search filter now,
+--     never a provider query param — see the provider audit). Added
+--     request-budget and cache-TTL columns. `schedule_mode` now also
+--     allows 'strict'.
+--   * search_runs: added request-efficiency telemetry columns.
+--   * flight_results: the flat baggage/price columns became JSONB
+--     (`passengers`, `baggage`, `price`, `booking`) because they're now
+--     structured breakdowns, not single values — `effective_price` and
+--     `currency` stay as real columns so they can still be indexed/queried
+--     directly. Added `expires_at` (offers are ephemeral).
+--   * flight_price_history: same baggage/passenger JSONB treatment, dropped
+--     the granular fee columns (kept only on flight_results — history only
+--     needs the bottom-line `effective_price` + `pricing_breakdown_available`).
+--   * alerts: `price_per_pax` + `passengers` (int) -> `passengers` (jsonb) +
+--     `total_price` + `adult_price` + `child_prices`.
+--   * new tables: `provider_cache` (dedup layer) and `request_log` (backs
+--     the request budget + the API Usage dashboard).
+--
+-- Design notes carried over from v1:
 --   * `users` mirrors `auth.users` (Supabase Auth) with a 1:1 profile row.
---     The app currently runs with a single demo user (see src/lib/constants
---     DEMO_USER_ID) until real auth is wired up — RLS is already scoped per
---     user so multi-user support is a matter of enabling Supabase Auth on
---     the frontend, not changing the schema.
 --   * `flight_price_history` is intentionally NOT foreign-keyed to
---     `flight_searches.search_id`: history is aggregated per route
---     (origin/destination), not per search, and backfilled/seeded rows use
---     a synthetic "seed" tag. It's kept as a plain indexed text column.
---   * Every price component that a provider might not return (fees,
---     baggage_cost) is nullable — the application must render "no
---     informado" rather than assuming 0, per the product spec.
+--     `flight_searches.id`: history is aggregated per route, and
+--     backfilled/seeded rows use a synthetic "seed" tag.
+--   * Every price component a provider might not return stays nullable —
+--     the application renders "no informado" rather than assuming a value.
 -- ============================================================================
 
 create extension if not exists "pgcrypto";
@@ -51,17 +66,21 @@ create table if not exists public.flight_searches (
   flexibility_days int not null default 0 check (flexibility_days in (0, 1, 2, 3, 5, 7)),
 
   adults int not null default 1 check (adults >= 1),
-  children int not null default 0 check (children >= 0),
-  baggage text not null check (baggage in ('none', 'carry_on', 'checked_1', 'checked_multiple')),
+  children_ages int[] not null default '{}',
+  baggage_requirement text not null check (baggage_requirement in ('none', 'carry_on', 'checked_1', 'checked_multiple')),
   max_stops smallint not null check (max_stops in (0, 1, 2)),
 
   target_price numeric(10, 2) not null check (target_price >= 0),
   max_price numeric(10, 2) not null check (max_price >= target_price),
   currency text not null check (currency in ('USD', 'ARS')),
 
-  schedule_mode text not null default 'any' check (schedule_mode in ('any', 'preferred')),
+  schedule_mode text not null default 'any' check (schedule_mode in ('any', 'preferred', 'strict')),
   departure_preferred_slots text[],
   return_preferred_slots text[],
+
+  max_requests_per_run int not null default 100 check (max_requests_per_run > 0),
+  max_requests_per_day int not null default 300 check (max_requests_per_day > 0),
+  cache_ttl_hours int not null default 12 check (cache_ttl_hours in (6, 12, 24)),
 
   status text not null default 'active' check (status in ('active', 'paused', 'error')),
 
@@ -89,7 +108,12 @@ create table if not exists public.search_runs (
   opportunities_found int not null default 0,
   alerts_sent int not null default 0,
   status text not null check (status in ('success', 'error')),
-  error_message text
+  error_message text,
+
+  requests_used int not null default 0,
+  cache_hits int not null default 0,
+  errors_by_code jsonb not null default '{}',
+  budget_exhausted boolean not null default false
 );
 
 create index if not exists idx_search_runs_search on public.search_runs (search_id, started_at desc);
@@ -108,18 +132,17 @@ create table if not exists public.flight_results (
   outbound jsonb not null, -- FlightLeg
   inbound jsonb,           -- FlightLeg | null (one-way)
 
-  baggage_included boolean not null default false,
-  baggage_option text not null,
+  passengers jsonb not null, -- PassengerConfig { adults, childrenAges }
+  baggage jsonb not null,    -- BaggageAllowance { included, checkedBags, carryOnIncluded, addCost } — attribute of the offer
+  price jsonb not null,      -- PriceBreakdown { passengers: PassengerPriceBreakdown, fees, baggageCost, otherCharges, effectivePrice, currency }
 
-  base_price numeric(10, 2) not null,
-  fees numeric(10, 2),
-  baggage_cost numeric(10, 2),
-  other_charges numeric(10, 2),
-  effective_price numeric(10, 2) not null,
+  effective_price numeric(10, 2) not null, -- denormalized from price.effectivePrice for indexing/queries
   currency text not null,
 
   source text not null,
-  booking_url text not null,
+  booking jsonb not null,   -- BookingInfo { type, url? | offerId? }
+  expires_at timestamptz,   -- offers are ephemeral; null = provider gave no expiry
+
   found_at timestamptz not null default now()
 );
 
@@ -128,7 +151,9 @@ create index if not exists idx_flight_results_run on public.flight_results (sear
 create index if not exists idx_flight_results_route on public.flight_results (origin, destination);
 
 -- ----------------------------------------------------------------------------
--- flight_price_history — permanent, append-only price observations
+-- flight_price_history — permanent, append-only market observations
+-- (MarketObservation is persisted here rather than in a separate table —
+-- see src/lib/types.ts for the rationale)
 -- ----------------------------------------------------------------------------
 create table if not exists public.flight_price_history (
   id text primary key,
@@ -148,11 +173,10 @@ create table if not exists public.flight_price_history (
 
   stops smallint not null default 0,
   duration_minutes int not null,
-  baggage text not null,
+  baggage jsonb not null,      -- BaggageAllowance
+  passengers jsonb not null,   -- PassengerConfig this observation's price applies to
 
-  base_price numeric(10, 2) not null,
-  fees numeric(10, 2),
-  baggage_cost numeric(10, 2),
+  pricing_breakdown_available boolean not null default false,
   effective_price numeric(10, 2) not null,
   currency text not null,
 
@@ -191,9 +215,11 @@ create table if not exists public.alerts (
   departure_date date not null,
   return_date date,
 
-  price_per_pax numeric(10, 2) not null,
+  passengers jsonb not null, -- PassengerConfig
   total_price numeric(10, 2) not null,
-  passengers int not null default 1,
+  pricing_breakdown_available boolean not null default false,
+  adult_price numeric(10, 2),
+  child_prices numeric(10, 2)[],
   currency text not null,
 
   average_price numeric(10, 2),
@@ -209,6 +235,39 @@ create table if not exists public.alerts (
 );
 
 create index if not exists idx_alerts_search on public.alerts (search_id, created_at desc);
+
+-- ----------------------------------------------------------------------------
+-- provider_cache — dedup layer keyed by a canonical query signature
+-- (spec §5-6: "si se buscó EZE→MIA 16/11 hace menos de X horas, no volver a
+-- consultar salvo que haya expirado el TTL o el usuario fuerce refresh")
+-- ----------------------------------------------------------------------------
+create table if not exists public.provider_cache (
+  key text primary key,
+  endpoint text not null check (endpoint in ('searchFlights', 'getPriceCalendar', 'getFlightDetails', 'getPriceHistory')),
+  payload jsonb not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+
+create index if not exists idx_provider_cache_expires on public.provider_cache (expires_at);
+
+-- ----------------------------------------------------------------------------
+-- request_log — one row per attempted provider call (cache hit, success or
+-- error). Backs the request budget, cache-hit stats and the API Usage
+-- dashboard from a single source of truth.
+-- ----------------------------------------------------------------------------
+create table if not exists public.request_log (
+  id uuid primary key default gen_random_uuid(),
+  search_id uuid not null references public.flight_searches (id) on delete cascade,
+  search_run_id uuid references public.search_runs (id) on delete set null,
+  "timestamp" timestamptz not null default now(),
+  endpoint text not null check (endpoint in ('searchFlights', 'getPriceCalendar', 'getFlightDetails', 'getPriceHistory')),
+  outcome text not null check (outcome in ('success', 'error', 'cache_hit')),
+  error_code text check (error_code in ('RATE_LIMITED', 'TIMEOUT', 'INVALID_ROUTE', 'AUTHENTICATION', 'QUOTA_EXCEEDED', 'PROVIDER_ERROR', 'UNKNOWN')),
+  cache_key text
+);
+
+create index if not exists idx_request_log_search_time on public.request_log (search_id, "timestamp" desc);
 
 -- ----------------------------------------------------------------------------
 -- airports / airlines — reference data
@@ -253,6 +312,8 @@ alter table public.flight_results enable row level security;
 alter table public.flight_price_history enable row level security;
 alter table public.notification_settings enable row level security;
 alter table public.alerts enable row level security;
+alter table public.provider_cache enable row level security;
+alter table public.request_log enable row level security;
 alter table public.airports enable row level security;
 alter table public.airlines enable row level security;
 
@@ -270,7 +331,7 @@ drop policy if exists "flight_searches_owner" on public.flight_searches;
 create policy "flight_searches_owner" on public.flight_searches
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
--- search_runs / flight_results / notification_settings / alerts:
+-- search_runs / flight_results / notification_settings / alerts / request_log:
 -- readable/writable only through the owning search
 drop policy if exists "search_runs_owner" on public.search_runs;
 create policy "search_runs_owner" on public.search_runs
@@ -296,11 +357,21 @@ create policy "alerts_owner" on public.alerts
     exists (select 1 from public.flight_searches fs where fs.id = search_id and fs.user_id = auth.uid())
   );
 
--- flight_price_history: shared market data — any authenticated user can
--- read it (it's aggregated by route, not personal), writes are only ever
--- performed by the backend using the service role key (which bypasses RLS).
+drop policy if exists "request_log_owner" on public.request_log;
+create policy "request_log_owner" on public.request_log
+  for all using (
+    exists (select 1 from public.flight_searches fs where fs.id = search_id and fs.user_id = auth.uid())
+  );
+
+-- flight_price_history / provider_cache: shared market data — any
+-- authenticated user can read it, writes only ever come from the backend
+-- using the service role key (which bypasses RLS).
 drop policy if exists "price_history_read" on public.flight_price_history;
 create policy "price_history_read" on public.flight_price_history
+  for select using (auth.role() = 'authenticated');
+
+drop policy if exists "provider_cache_read" on public.provider_cache;
+create policy "provider_cache_read" on public.provider_cache
   for select using (auth.role() = 'authenticated');
 
 -- airports / airlines: public reference data, readable by anyone

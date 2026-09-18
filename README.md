@@ -124,15 +124,12 @@ según si `SUPABASE_URL` está configurado. La interfaz `Repository`
 
 ## 4. Cómo funciona el motor de oportunidades
 
-1. **Combinaciones** (`engine/combinations.ts`): a partir de un rango de
-   fechas, un rango de noches y los aeropuertos (expandidos si "aeropuertos
-   alternativos" está activo), se muestrea un conjunto acotado y
-   representativo de combinaciones — no el producto cartesiano completo, para
-   que una corrida termine en segundos.
-2. **Búsqueda** (`engine/runSearch.ts`): cada combinación se consulta al
-   proveedor activo, que devuelve varios itinerarios con distintos horarios,
-   aerolíneas y escalas. Todo se guarda en `flight_results` y
-   `flight_price_history`.
+1. **Estrategia de búsqueda** (`engine/searchStrategy.ts` + `engine/priority.ts`
+   + `engine/runSearch.ts`) — motor en dos niveles, pensado para no volear
+   cientos de requests contra una API real (ver sección 4bis).
+2. **Búsqueda**: cada combinación elegida se consulta al proveedor activo, que
+   devuelve varios itinerarios con distintos horarios, aerolíneas y escalas.
+   Todo se guarda en `flight_results` y `flight_price_history`.
 3. **Estadísticas históricas** (`analytics/stats.ts`): por cada ruta se
    calculan promedio, mediana, mínimo, máximo, percentil 10/25 y promedios de
    7/30/90 días sobre el histórico acumulado.
@@ -145,12 +142,122 @@ según si `SUPABASE_URL` está configurado. La interfaz `Repository`
    configurado por canal generan una alerta, con una clave de deduplicación
    (`alerts/dedup.ts`) que evita reenviar el mismo vuelo/precio.
 6. **Log** (`search_runs`): cada corrida registra combinaciones analizadas,
-   vuelos encontrados, oportunidades y alertas enviadas.
+   vuelos encontrados, oportunidades, alertas enviadas y telemetría de
+   requests (ver sección 4bis).
 
 La UI separa siempre tres cosas (ver spec original, sección 29): **DATOS**
 (precio, escalas, equipaje) vs. **ANÁLISIS** (% vs. promedio/objetivo/mínimo)
 vs. **ALERTA** (qué regla se cumplió) — nunca se mezclan como si fueran lo
 mismo.
+
+---
+
+## 4bis. Motor de búsqueda eficiente (v2)
+
+Rediseñado explícitamente para no depender de "una request por combinación"
+cuando conectemos una API real con rate limit y costo por búsqueda.
+
+### Dos niveles
+
+```
+Configuración
+      ↓
+Nivel 1 — Exploración        (engine/searchStrategy.ts)
+      ↓                       1 request de calendario por ruta si el
+      ↓                       proveedor lo soporta (provider.capabilities.
+      ↓                       supportsPriceCalendar) — si no, cae a un
+      ↓                       muestreo acotado de búsquedas exactas.
+Detectar zonas baratas         (engine/priority.ts)
+      ↓                       scoring determinístico (sin ML): cercanía al
+      ↓                       mínimo histórico, al objetivo, franja horaria
+      ↓                       históricamente barata, aeropuerto alternativo
+      ↓                       con descuento conocido.
+Nivel 2 — Profundización       (engine/runSearch.ts)
+      ↓                       búsquedas exactas SOLO sobre los candidatos
+      ↓                       de mayor prioridad, acotadas por el
+      ↓                       presupuesto de requests restante.
+Resultados detallados → Opportunity Engine → Alerta
+```
+
+### Presupuesto de requests
+
+Cada búsqueda tiene `requestBudget: { maxRequestsPerRun, maxRequestsPerDay }`
+(default 100/300, configurable en el formulario). El motor nunca los supera —
+`SearchRun.budgetExhausted` queda en `true` cuando había más candidatos que
+presupuesto disponible. Ver `/api-usage` para el consumo en vivo.
+
+### Cache / deduplicación
+
+Antes de cualquier request real, se calcula una clave determinística
+(`engine/cache.ts`, `buildSearchCacheKey`):
+
+```
+EZE|MIA|2026-11-16|2026-11-26|2ADT|3CHD|USD
+```
+
+Si existe una entrada en `provider_cache` fresca (dentro del
+`cacheTtlHours` configurado — 6/12/24h), se reutiliza y **no** cuenta contra
+el presupuesto de requests. El botón "Ejecutar búsqueda ahora" tiene un
+checkbox "Forzar actualización" que ignora el cache para esa corrida.
+
+### Errores por combinación, retry y rate limit
+
+`providers/errors.ts` define `ProviderError` con códigos
+`RATE_LIMITED | TIMEOUT | INVALID_ROUTE | AUTHENTICATION | QUOTA_EXCEEDED |
+PROVIDER_ERROR | UNKNOWN`. `providers/retryPolicy.ts` decide, por código, si
+reintentar (con qué backoff) o abortar toda la corrida — solo
+`AUTHENTICATION` (error de configuración) y `QUOTA_EXCEEDED` detienen la
+corrida completa; el resto de los errores se registra y el motor sigue con
+la siguiente combinación (`engine/runSearch.ts` ya no tiene un único
+`try/catch` alrededor de todo el loop). `providers/rateLimiter.ts` es un
+limitador genérico configurado desde `provider.rateLimit` — nunca asume un
+límite fijo, lo declara el proveedor.
+
+### Precio por pasajero (corrección del modelo v1)
+
+v1 asumía `effectivePrice × cantidad_de_pasajeros`, como si todos pagaran
+igual. Ahora:
+
+- `PassengerConfig` es `{ adults, childrenAges: number[] }` — la edad importa
+  porque las tarifas reales varían por franja etaria, no por "es un niño sí/no".
+- `PriceBreakdown.passengers` es un `PassengerPriceBreakdown` con
+  `adultPrice`, `childPrices[]` y `totalPrice`. Cuando el proveedor solo
+  informa un total (`pricingBreakdownAvailable: false`), **nunca se inventa**
+  un desglose — se guarda el total tal cual.
+- **Dos unidades de precio conviven a propósito**: `FlightResult.price.
+  effectivePrice` es el **total de la reserva** (lo que se muestra en
+  "Total estimado" de una alerta); `referenceUnitPrice()` (`types.ts`) es el
+  **precio de referencia por adulto**, y es el que se compara contra
+  `targetPrice`/`maxPrice`, el histórico y el Opportunity Score — igual que
+  los ejemplos del spec original ("Precio objetivo: USD 750" junto a "Total
+  estimado: USD 3.675" para 5 pasajeros). Mezclar ambas unidades fue un bug
+  real que apareció durante el desarrollo de esta versión (alertas dejaban
+  de dispararse porque el total de 5 pasajeros superaba un `maxPrice`
+  pensado por-adulto) — quedó cubierto por los tests y corregido en un único
+  punto (`referenceUnitPrice`).
+
+### Equipaje y booking
+
+`baggageRequirement` en la búsqueda es lo que el usuario **pide**;
+`FlightResult.baggage` (`BaggageAllowance`) es lo que la oferta **informa** —
+nunca se envía como parámetro de búsqueda al proveedor (las APIs reales no
+lo soportan así, ver la auditoría técnica). `engine/filters.ts` expone el
+filtro posterior (`filterByBaggageRequirement`) para la UI. `FlightResult.
+booking` reemplaza el viejo `bookingUrl: string` por una unión
+(`deep_link | api_order | search_link | unavailable`) que no obliga a un
+proveedor tipo Duffel (booking vía API, sin link) a fingir que tiene un
+enlace. `FlightResult.expiresAt` modela ofertas efímeras — pasado ese
+momento la UI muestra "Este precio puede haber cambiado. Actualizar precio."
+en vez de asumir que sigue vigente.
+
+### Tests
+
+`npm run test` (Vitest) cubre deduplicación, cache/TTL, retry por código de
+error, rate limiting con reloj simulado, continuidad ante errores por
+combinación (y aborto correcto en `AUTHENTICATION`/`QUOTA_EXCEEDED`), la
+fórmula de precio total, tarifas diferenciadas por edad, equipaje como
+"no informado", expiración de ofertas, el Opportunity Score y el presupuesto
+de requests.
 
 ---
 
@@ -209,37 +316,49 @@ a `SupabaseRepository` — ninguna pantalla necesita tocarse.
 
 ## 7. Conectar una API de vuelos real
 
-**Importante:** no existe una API pública de Google Flights apta para este
-uso. Las opciones típicas son Amadeus Self-Service API, Duffel, Skyscanner
-Partner API o un scraper propio — ninguna está conectada todavía, y no debe
-simularse que lo está.
+**Importante:** no existe una API pública oficial de Google Flights (la
+única que existió, QPX Express, cerró en 2018 y nunca tuvo reemplazo
+público). Tampoco asumas que **Amadeus Self-Service** sigue siendo una
+opción de alta inmediata — Amadeus decomisionó ese portal el 17/07/2026; lo
+que queda es Amadeus Enterprise, sin autoservicio. Ver la auditoría técnica
+completa (sesión de este proyecto) para el detalle de cada proveedor
+investigado — hoy los candidatos con alta self-service real son **Duffel**
+(API de booking, tarifas por tipo de pasajero, sandbox gratis) y **SerpApi**
+(no oficial, parsea resultados de Google Flights, modelo deep-link). Ninguno
+está conectado todavía, y no debe simularse que lo está.
 
 Para conectar una:
 
-1. Creá `src/lib/providers/AmadeusFlightProvider.ts` (o el nombre que
+1. Creá `src/lib/providers/DuffelFlightProvider.ts` (o el nombre que
    corresponda) implementando la interfaz `FlightSearchProvider`
    (`searchFlights`, `getFlightDetails`, `getPriceCalendar`,
-   `getPriceHistory`).
+   `getPriceHistory`), y declarando honestamente sus `capabilities` y
+   `rateLimit` (ver `providers/FlightSearchProvider.ts` — el motor adapta la
+   estrategia de exploración a lo que el proveedor realmente soporta).
 2. Registralo en `src/lib/providers/index.ts`:
    ```ts
-   import { amadeusFlightProvider } from "./AmadeusFlightProvider";
+   import { duffelFlightProvider } from "./DuffelFlightProvider";
    const PROVIDERS = {
      mock: mockFlightProvider,
-     amadeus: amadeusFlightProvider,
+     duffel: duffelFlightProvider,
    };
    ```
 3. Configurá las credenciales en `.env.local`:
    ```
-   FLIGHT_API_PROVIDER=amadeus
+   FLIGHT_API_PROVIDER=duffel
    FLIGHT_API_KEY=...
-   FLIGHT_API_SECRET=...
    ```
 4. Nada más cambia: el motor, las pantallas, el scheduler y las alertas ya
    están escritos contra la interfaz, no contra `MockFlightProvider`.
 
-Cuando un componente de precio no venga informado por la API real (tasas,
-costo de equipaje), dejalo en `null` — la UI ya sabe mostrar "no informado" y
-la capa de análisis nunca inventa ese número.
+Cambios de modelo a tener en cuenta según el proveedor elegido (ver sección
+4bis): si el proveedor es API-order (Duffel/Amadeus) en vez de deep-link
+(SerpApi/Skyscanner), `FlightResult.booking` debe devolver `{ type:
+"api_order", offerId }` en vez de una URL — la UI ya sabe renderizar ambos
+casos. Cuando un componente de precio no venga informado por la API real
+(tasas, costo de equipaje, desglose por pasajero), dejalo en `null` — la UI
+ya sabe mostrar "no informado" y la capa de análisis nunca inventa ese
+número.
 
 ---
 
