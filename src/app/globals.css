@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background-color: #0a0d12;
+  color: #e7ecf3;
+}
+
+body {
+  font-feature-settings: "tnum" 1, "cv11" 1;
+}
+
+::selection {
+  background: rgba(45, 212, 191, 0.3);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #39475e;
+  border-radius: 4px;
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-white/5 bg-base-900 shadow-card;
+  }
+  .card-pad {
+    @apply p-4 sm:p-5;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply btn bg-accent-500 text-base-950 hover:bg-accent-400;
+  }
+  .btn-secondary {
+    @apply btn bg-base-800 text-base-100 hover:bg-base-700 border border-white/10;
+  }
+  .btn-ghost {
+    @apply btn text-base-300 hover:text-base-50 hover:bg-white/5;
+  }
+  .input {
+    @apply w-full rounded-lg border border-white/10 bg-base-850 px-3 py-2 text-sm text-base-50 placeholder:text-base-500 focus:outline-none focus:ring-2 focus:ring-accent-500/50;
+  }
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-base-400;
+  }
+  .section-title {
+    @apply text-sm font-semibold uppercase tracking-wide text-base-300;
+  }
+}
